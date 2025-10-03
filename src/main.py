@@ -1,96 +1,70 @@
 import time
 import cv2
-import mediapipe as mp
+import torch
+import numpy as np
+from facenet_pytorch import MTCNN
+from transformers import AutoFeatureExtractor, AutoModelForImageClassification, AutoConfig
 
 def load_detectors():
-    mp_face_mesh = mp.solutions.face_mesh
-    face_mesh = mp_face_mesh.FaceMesh(
-        max_num_faces=1,
-        refine_landmarks=True,
-        min_detection_confidence=0.5,
-        min_tracking_confidence=0.5
+    mtcnn = MTCNN(
+        image_size=160,
+        margin=0,
+        min_face_size=20,
+        thresholds=[0.6, 0.7, 0.7],
+        factor=0.709,
+        post_process=True,
+        keep_all=False,
+        device='cpu'
     )
-    return {"face_mesh": face_mesh}
-
+    extractor = AutoFeatureExtractor.from_pretrained("trpakov/vit-face-expression")
+    model = AutoModelForImageClassification.from_pretrained("trpakov/vit-face-expression")
+    return {"mtcnn": mtcnn, "extractor": extractor, "model": model}
 
 def detect_faces(frame, detectors):
     rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    results = detectors["face_mesh"].process(rgb_frame)
-    
-    if results.multi_face_landmarks:
-        for face_landmarks in results.multi_face_landmarks:
-            h, w, _ = frame.shape
-            landmarks = [(int(p.x * w), int(p.y * h)) for p in face_landmarks.landmark]
-            
-            x_min = min([p[0] for p in landmarks])
-            x_max = max([p[0] for p in landmarks])
-            y_min = min([p[1] for p in landmarks])
-            y_max = max([p[1] for p in landmarks])
-            cv2.rectangle(frame, (x_min, y_min), (x_max, y_max), (0, 255, 0), 2)
-
-            # Left eye: indices 33, 160, 158, 133, 153, 144
-            # Right eye: indices 362, 385, 387, 263, 373, 380
-            left_eye = [
-                landmarks[33], landmarks[160], landmarks[158],
-                landmarks[133], landmarks[153], landmarks[144]
-            ]
-            right_eye = [
-                landmarks[362], landmarks[385], landmarks[387],
-                landmarks[263], landmarks[373], landmarks[380]
-            ]
-
-            for (x, y) in left_eye + right_eye:
-                cv2.circle(frame, (x, y), 2, (255, 0, 0), -1)
-
+    boxes, _ = detectors["mtcnn"].detect(rgb_frame)
+    if boxes is not None:
+        for box in boxes:
+            x_min, y_min, x_max, y_max = map(int, box)
+            cv2.rectangle(frame, (x_min, y_min), (x_max, y_max), (255, 0, 0), 2)
     return frame
 
 def detect_emotion(frame, detectors):
     rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    results = detectors["face_mesh"].process(rgb_frame)
     timestamp = time.strftime("%H:%M:%S")
-    emotion = "neutral"
 
-    if results.multi_face_landmarks:
+    boxes, _ = detectors["mtcnn"].detect(rgb_frame)
+    if boxes is not None:
+        x_min, y_min, x_max, y_max = map(int, boxes[0])
         h, w, _ = frame.shape
-        landmarks = [(int(p.x * w), int(p.y * h)) for p in results.multi_face_landmarks[0].landmark]
-        x_min = min([p[0] for p in landmarks])
-        x_max = max([p[0] for p in landmarks])
-        y_min = min([p[1] for p in landmarks])
-        y_max = max([p[1] for p in landmarks])
+        x_min, x_max = max(0, x_min), min(w, x_max)
+        y_min, y_max = max(0, y_min), min(h, y_max)
+        if x_max > x_min and y_max > y_min:
+            face = rgb_frame[y_min:y_max, x_min:x_max]
+            inputs = detectors["extractor"](images=face, return_tensors="pt")
+            with torch.no_grad():
+                outputs = detectors["model"](**inputs)
+            probabilities = torch.nn.functional.softmax(outputs.logits, dim=-1)
 
-        face = frame[y_min:y_max, x_min:x_max]
-        if face.size > 0:
-            try:
-                result = DeepFace.analyze(face, actions=['emotion'], enforce_detection=False)
-                emotion = result[0]['dominant_emotion']
-            except:
-                pass 
+            id2label = AutoConfig.from_pretrained("trpakov/vit-face-expression").id2label
+            probabilities = probabilities.detach().numpy()[0]
+            max_idx = np.argmax(probabilities)
+            emotion = id2label[max_idx]
 
     return emotion, timestamp, frame
 
 
 def process_video(video_path: str) -> None:
     detectors = load_detectors()
-    cap = cv2.VideoCapture(video_path)
 
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
+    frame = cv2.imread(video_path)
 
-        frame = detect_faces(frame, detectors)
-        emotion, timestamp, frame = detect_emotion(frame, detectors)
-        cv2.putText(frame, f"Emotion: {emotion}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-        cv2.imshow('Face Emotion Detection', frame)
-        print(f"{timestamp}: {emotion}")
-
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
-
-    cap.release()
-    cv2.destroyAllWindows()
-    detectors["face_mesh"].close()
-
+    frame = detect_faces(frame, detectors)
+    emotion, timestamp, frame = detect_emotion(frame, detectors)
+    cv2.putText(frame, f"Emotion: {emotion}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2)
+    cv2.imshow('Face Emotion Detection', frame)
+    print(f"{timestamp}: {emotion}")
+    cv2.waitKey(0)
 
 if __name__ == "__main__":
-    process_video("./data/sample_video.mp4")
+    process_video("./data/angry_face.png")
